@@ -157,6 +157,8 @@ class BiCodecTokenizer:
         Returns:
             wav_rec: waveform. shape: (batch_size, seq_len) for batch or (seq_len,) for single
         """
+        if semantic_tokens.size(1) == 0:
+            raise ValueError("Semantic tokens are empty. The input audio may be too short or invalid.")
         global_tokens = global_tokens.unsqueeze(1)
         wav_rec = self.model.detokenize(semantic_tokens, global_tokens)
         return wav_rec.detach().squeeze().cpu().numpy()
