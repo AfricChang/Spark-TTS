@@ -5,6 +5,9 @@ import tempfile
 import subprocess
 import datetime
 import torch
+import re
+import shutil
+import time
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                             QLabel, QLineEdit, QTextEdit, QScrollArea, QGridLayout,
                             QTabWidget, QFrame, QStackedWidget, QComboBox, QPlainTextEdit,
@@ -283,54 +286,135 @@ class SynthesisThread(QThread):
     synthesis_complete = pyqtSignal(bool, str)  # 信号：合成完成(成功/失败, 输出文件路径)
     progress_update = pyqtSignal(str)  # 信号：进度更新
 
-    # Modify init to accept SparkTTS parameters
     def __init__(self, text, prompt_text, prompt_speech_path, output_path, model_dir, device):
         super().__init__()
         self.text = text
         self.prompt_text = prompt_text
         self.prompt_speech_path = prompt_speech_path
         self.output_path = output_path
-        self.model_dir = model_dir
-        self.device = device
-        # Removed voice_id, speed, volume as they are not directly used by SparkTTS inference
+        self.model_dir = model_dir  # 恢复模型目录参数 
+        self.device = device        # 恢复设备参数
+        # 不再接收预加载的模型
 
     def run(self):
         # Redirect stdout to capture progress
         original_stdout = sys.stdout
         sys.stdout = self
+        
         success = False
+        start_time = time.time() # Record start time
+        synthesis_duration = 0
+        
+        # 记录更详细的输入信息
+        self.progress_update.emit("---合成任务开始---")
+        self.progress_update.emit(f"文本长度: {len(self.text)} 字符")
+        self.progress_update.emit(f"参考文本长度: {len(self.prompt_text)} 字符")
+        self.progress_update.emit(f"参考音频路径: {self.prompt_speech_path}")
+        self.progress_update.emit(f"输出路径: {self.output_path}")
+        
         try:
-            self.progress_update.emit("正在加载 Spark-TTS 模型...")
-            # Ensure device is correctly formatted
-            if isinstance(self.device, str) and self.device.startswith("cuda") and ":" not in self.device:
-                 tts_device = f"cuda:0" # Default to cuda:0 if only 'cuda' is provided
-            else:
-                 tts_device = self.device
-
-            model = SparkTTS(
-                model_dir=self.model_dir,
-                device=tts_device
-            )
-            self.progress_update.emit("模型加载完成，开始合成...")
+            # 每次创建新的模型实例
+            self.progress_update.emit(f"正在加载 Spark-TTS 模型 (目录: {self.model_dir}, 设备: {self.device})...")
+            model_load_start = time.time()
+            tts_model = SparkTTS(model_dir=self.model_dir, device=self.device)
+            model_load_end = time.time()
+            model_load_duration = model_load_end - model_load_start
+            self.progress_update.emit(f"模型加载完成，耗时 {model_load_duration:.2f} 秒")
             
-            wav = model.inference(
-                text=self.text,
-                prompt_text=self.prompt_text,
-                prompt_speech_path=self.prompt_speech_path
-            )
+            # 输出更多诊断信息
+            text_length = len(self.text) if self.text else 0
+            self.progress_update.emit(f"准备合成文本: 【{self.text[:100]}...】")
+            if text_length < 30:
+                self.progress_update.emit(f"警告: 文本长度较短 ({text_length} 字符)，可能会导致合成失败")
             
-            if wav is not None:
-                sf.write(self.output_path, wav, 16000)
-                success = True
-                self.progress_update.emit(f"合成成功！音频已保存到: {self.output_path}")
-            else:
-                self.progress_update.emit("合成失败：模型未能生成有效音频。")
+            self.progress_update.emit("开始合成...")
+            
+            # 特别处理可能会导致语义令牌问题的情况
+            if self.text.startswith("每日资讯") or re.search(r'^\d+[、.．]', self.text):
+                self.progress_update.emit("检测到可能导致问题的文本格式（标题或编号）")
+                # 尝试移除可能导致问题的格式
+                cleaned_text = re.sub(r'^(每日资讯.*?\n|^\d+[、.．])', '', self.text)
+                self.progress_update.emit(f"已尝试清理文本格式，处理前: {len(self.text)} 字符，处理后: {len(cleaned_text)} 字符")
+                self.text = cleaned_text
+                
+            inference_start_time = time.time() # Start timing inference
+            # 使用新创建的模型实例
+            try:
+                self.progress_update.emit(f"开始推理...参考音频: {os.path.basename(self.prompt_speech_path)}")
+                wav = tts_model.inference(
+                    text=self.text,
+                    prompt_text=self.prompt_text,
+                    prompt_speech_path=self.prompt_speech_path
+                )
+                inference_end_time = time.time() # End timing inference
+                synthesis_duration = inference_end_time - inference_start_time
+                
+                if wav is not None:
+                    write_start_time = time.time()
+                    sf.write(self.output_path, wav, 16000)
+                    write_end_time = time.time()
+                    write_duration = write_end_time - write_start_time
+                    success = True
+                    # Include duration in the success message
+                    self.progress_update.emit(f"合成成功！耗时: {synthesis_duration:.2f} 秒 (写入文件: {write_duration:.2f} 秒)。音频已保存到: {self.output_path}")
+                else:
+                    self.progress_update.emit("合成失败：模型未能生成有效音频。")
+            except ValueError as ve:
+                # 特别处理"Semantic tokens are empty"错误
+                if "Semantic tokens are empty" in str(ve):
+                    error_msg = f"【关键错误】语义令牌为空，这通常由于以下原因导致:\n" 
+                    error_msg += f"1. 文本太短或格式不适合合成 (当前长度: {text_length})\n"
+                    error_msg += f"2. 参考音频与文本不匹配\n"
+                    error_msg += f"3. 文本开头有数字编号、特殊符号等\n"
+                    error_msg += f"合成文本内容: '{self.text[:100]}{'...' if len(self.text)>100 else ''}'"
+                    self.progress_update.emit(error_msg)
+                    
+                    # 尝试更强的干预措施 - 如果失败两次，尝试不同的文本格式
+                    try:
+                        # 仅使用前30-80个字符，避免格式问题
+                        simple_text = self.text.replace("\n", " ")
+                        simple_text = re.sub(r'\d+[、.．]', '', simple_text)
+                        if len(simple_text) > 80:
+                            simple_text = simple_text[:80]
+                        elif len(simple_text) < 30:
+                            simple_text = simple_text * 2  # 重复文本使其足够长
+                            
+                        self.progress_update.emit(f"尝试使用简化文本重新合成: '{simple_text}'")
+                        
+                        # 再次尝试合成
+                        wav = tts_model.inference(
+                            text=simple_text,
+                            prompt_text=self.prompt_text,
+                            prompt_speech_path=self.prompt_speech_path
+                        )
+                        
+                        if wav is not None:
+                            sf.write(self.output_path, wav, 16000)
+                            success = True
+                            self.progress_update.emit(f"使用简化文本合成成功！音频已保存到: {self.output_path}")
+                        else:
+                            self.progress_update.emit("使用简化文本合成仍然失败。")
+                    except Exception as retry_e:
+                        self.progress_update.emit(f"重试合成时发生错误: {retry_e}")
+                else:
+                    # 其他ValueError错误
+                    error_msg = f"合成值错误: {ve}\n{traceback.format_exc()}"
+                    self.progress_update.emit(error_msg)
+            except Exception as e:
+                # 处理其他异常
+                error_msg = f"合成时发生错误: {e}\n{traceback.format_exc()}"
+                self.progress_update.emit(error_msg)
 
         except Exception as e:
-            error_msg = f"合成过程中发生错误: {e}\n{traceback.format_exc()}"
+            # Make sure to log the full traceback in case of inference errors
+            error_msg = f"合成线程中发生错误: {e}\n{traceback.format_exc()}"
             self.progress_update.emit(error_msg)
             print(error_msg) # Also print to console/log
         finally:
+            end_time = time.time() # Record end time for the whole process
+            total_duration = end_time - start_time
+            self.progress_update.emit(f"线程总耗时: {total_duration:.2f} 秒") # Log total thread time
+            self.progress_update.emit("---合成任务结束---")
             sys.stdout = original_stdout # Restore stdout
             self.synthesis_complete.emit(success, self.output_path)
 
@@ -343,6 +427,7 @@ class SynthesisThread(QThread):
         # 必须有的方法，用于io操作
         pass
 
+# TTSApp类定义
 class TTSApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -371,6 +456,15 @@ class TTSApp(QWidget):
         self.model_dir = "pretrained_models/Spark-TTS-0.5B" # Make this configurable later?
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.selected_prompt_audio_path = "" # Path for prompt audio
+
+        # State variables for chunked synthesis
+        self.is_chunked_synthesis = False
+        self.text_chunks = []
+        self.current_chunk_index = 0
+        self.temp_audio_files = []
+        self.final_output_path = "" # Store the path for the final merged file
+        self.ffmpeg_path = None # Store path to ffmpeg executable
+        self.tts_model = None # Placeholder for the loaded TTS model instance
         
         # Load voices first as UI might depend on it
         self.voice_list = [] # Initialize voice list
@@ -382,6 +476,18 @@ class TTSApp(QWidget):
         # Update UI elements after it's built
         self.update_voice_list() # Populate voice grid etc.
         self.log("系统初始化完成")
+        self.log(f"检测到设备: {self.device}")
+
+        # Check for ffmpeg at the specified relative path
+        relative_ffmpeg_path = os.path.join("softwares", "ffmpeg", "ffmpeg.exe")
+        absolute_ffmpeg_path = get_resource_path(relative_ffmpeg_path)
+
+        if os.path.exists(absolute_ffmpeg_path) and os.path.isfile(absolute_ffmpeg_path):
+            self.ffmpeg_path = absolute_ffmpeg_path
+            self.log(f"检测到 FFmpeg: {self.ffmpeg_path}，长文本合成已启用。")
+        else:
+            self.log(f"警告：未在预期路径 {relative_ffmpeg_path} 找到 FFmpeg，长文本合并功能将不可用。")
+            self.log(f"(尝试查找的绝对路径: {absolute_ffmpeg_path})")
 
     def load_voice_types(self):
         """从CSV文件加载音色类型"""
@@ -898,64 +1004,84 @@ class TTSApp(QWidget):
         self.volume_label.setText(f"音量: {value}")
     
     def on_synthesize(self):
-        """开始语音合成"""
+        """开始语音合成（支持分块）"""
         text = self.text_input.toPlainText().strip()
         prompt_text = self.prompt_text_edit.text().strip()
         prompt_audio_path = self.selected_prompt_audio_path
         
-        # --- Input Validation ---
+        # 临时更改：尝试不分块，直接合成
+        USE_SIMPLE_MODE = True  # 设置为True来尝试简单模式
+        
+        # --- Input Validation --- 
         if not text:
             InfoBar.warning("提示", "请输入要合成的文本", parent=self)
             return
         if not prompt_audio_path:
-             InfoBar.warning("提示", "请选择参考音频文件 (.wav)", parent=self)
-             return
+            InfoBar.warning("提示", "请选择参考音频文件 (.wav 或 .mp3)", parent=self)
+            return
         if not prompt_text:
-             InfoBar.warning("提示", "请输入参考音频对应的文本", parent=self)
-             return
-        if not os.path.exists(prompt_audio_path) or not prompt_audio_path.lower().endswith('.wav'):
-            InfoBar.error("错误", "参考音频文件无效或不是WAV格式", parent=self)
+            InfoBar.warning("提示", "请输入参考音频对应的文本", parent=self)
+            return
+        if not os.path.exists(prompt_audio_path) or not prompt_audio_path.lower().endswith(('.wav', '.mp3')):
+            InfoBar.error("错误", "参考音频文件无效或不是有效的音频格式", parent=self)
             return
         # -------------------------
 
-        self.log(f"准备使用 Spark-TTS 合成文本: '{text}'")
+        # --- Reset State for Chunked Synthesis ---
+        self.is_chunked_synthesis = False
+        self.text_chunks = []
+        self.current_chunk_index = 0
+        self.temp_audio_files = []
+        self.final_output_path = ""
+        # ----------------------------------------
+
+        self.log(f"准备使用 Spark-TTS 合成文本...")
         self.log(f"参考音频: {prompt_audio_path}")
         self.log(f"参考文本: '{prompt_text}'")
 
-        # Disable button during synthesis
+        # 禁用合成按钮，防止重复点击
         self.synthesize_button.setEnabled(False)
         self.synthesize_button.setText("合成中...")
 
-        # Prepare output path (Ensure Resources/output exists)
-        output_dir = get_resource_path("Resources/output")
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            now = datetime.datetime.now()
-            output_filename = f"sparktts_{now.strftime('%Y%m%d_%H%M%S')}.wav"
-            output_path = os.path.join(output_dir, output_filename)
-            self.log(f"输出路径: {output_path}")
-        except Exception as e:
-            self.log(f"创建输出目录或文件名时出错: {e}")
-            InfoBar.error("错误", f"无法准备输出路径: {e}", parent=self)
-            self.synthesize_button.setEnabled(True)
-            self.synthesize_button.setText("开始合成")
+        # 使用简单模式（不分块）
+        if USE_SIMPLE_MODE:
+            self.log("使用简单模式（不分块）进行合成...")
+            
+            # 清理文本以提高成功率
+            cleaned_text = self._clean_text_for_synthesis(text)
+            self.log(f"清理后文本长度: {len(cleaned_text)} 字符")
+            
+            # 准备输出路径
+            output_dir = get_resource_path("Resources/output")
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                now = datetime.datetime.now()
+                output_filename = f"sparktts_simple_{now.strftime('%Y%m%d_%H%M%S')}.wav"
+                output_path = os.path.join(output_dir, output_filename)
+                self.log(f"输出路径: {output_path}")
+            except Exception as e:
+                self.log(f"创建输出目录或文件名时出错: {e}")
+                InfoBar.error("错误", f"无法准备输出路径: {e}", parent=self)
+                self.synthesize_button.setEnabled(True)
+                self.synthesize_button.setText("开始合成")
+                return
+            
+            # 创建并启动合成线程
+            self.synthesis_thread = SynthesisThread(
+                text=cleaned_text,
+                prompt_text=prompt_text,
+                prompt_speech_path=prompt_audio_path,
+                output_path=output_path,
+                model_dir=self.model_dir,
+                device=self.device
+            )
+            self.synthesis_thread.progress_update.connect(self.log)
+            self.synthesis_thread.synthesis_complete.connect(self.on_synthesis_complete_standard)
+            self.synthesis_thread.start()
             return
-
-        # Create and start synthesis thread
-        self.synthesis_thread = SynthesisThread(
-            text=text,
-            prompt_text=prompt_text,
-            prompt_speech_path=prompt_audio_path,
-            output_path=output_path,
-            model_dir=self.model_dir,
-            device=self.device
-        )
-        self.synthesis_thread.progress_update.connect(self.log)
-        self.synthesis_thread.synthesis_complete.connect(self.on_synthesis_complete)
-        self.synthesis_thread.start()
-
-    def on_synthesis_complete(self, success, output_path):
-        """合成完成后的处理"""
+            
+    def on_synthesis_complete_standard(self, success, output_path):
+        """标准（单次）合成完成后的处理"""
         # Re-enable button
         self.synthesize_button.setEnabled(True)
         self.synthesize_button.setText("开始合成")
@@ -963,15 +1089,17 @@ class TTSApp(QWidget):
         if success and os.path.exists(output_path):
             self.log(f"合成成功，音频文件保存在: {output_path}")
             # Update the audio player controls
-            self.player_file_path = output_path # Store path for player
+            self.current_audio_file = output_path  # 保存当前文件路径
             self.play_button.setEnabled(True)
             self.player_slider.setEnabled(True)
             self.player_label.setText(os.path.basename(output_path))
             InfoBar.success("成功", "语音合成完成！", parent=self)
+            # 自动播放合成的音频
+            self.play_audio_file(output_path)
         else:
             self.log(f"合成失败. Success: {success}, Path: {output_path}")
             # Clear player state
-            self.player_file_path = None
+            self.current_audio_file = None
             self.play_button.setEnabled(False)
             self.player_slider.setEnabled(False)
             self.player_slider.setValue(0)
@@ -980,6 +1108,43 @@ class TTSApp(QWidget):
             
         # Clean up thread reference
         self.synthesis_thread = None # Allow garbage collection
+        
+    def _clean_text_for_synthesis(self, text):
+        """更彻底地清理文本，移除不利于合成的格式"""
+        if not text or len(text.strip()) < 5:
+            self.log("警告：合成文本过短，可能会导致模型失败。")
+            return text.strip()
+        
+        # 保存原始文本用于比较
+        original_text = text
+        
+        # 移除开头的数字和标点
+        cleaned_text = re.sub(r'^[\d]+[、.．:：]?\s*', '', text)
+        
+        # 移除"每日资讯简报"等标题行
+        cleaned_text = re.sub(r'^(每日|今日|晨间|晚间).*?(简报|资讯|新闻|播报).*?\n', '', cleaned_text)
+        
+        # 移除行内的编号 (如"1、""2、"等)
+        cleaned_text = re.sub(r'[\d]+[、.．:：]\s*', '', cleaned_text)
+        
+        # 移除末尾的标点符号
+        punctuation_to_clean = "。？！；…,.!?;:：，"
+        cleaned_text = cleaned_text.rstrip(punctuation_to_clean).strip()
+        
+        # 确保文本不为空
+        if not cleaned_text:
+            cleaned_text = original_text.strip()  # 至少保留原始文本
+            self.log("警告：清理后文本为空，将使用原始文本")
+        
+        # 记录文本清理前后的变化
+        if cleaned_text != original_text:
+            self.log(f"文本清理前：【{original_text[:40]}...】")
+            self.log(f"文本清理后：【{cleaned_text[:40]}...】")
+        
+        if len(cleaned_text) < 30:
+            self.log(f"警告：清理后的文本长度仅为 {len(cleaned_text)} 个字符，这可能会导致合成失败")
+            
+        return cleaned_text
 
     def play_audio_file(self, file_path):
         """使用Qt媒体播放器播放合成的音频文件"""
@@ -1007,7 +1172,7 @@ class TTSApp(QWidget):
         except Exception as e:
             self.log(f"播放音频失败: {str(e)}")
             return False
-    
+
     def media_state_changed(self, state):
         """媒体播放状态改变时的处理"""
         if state == QMediaPlayer.PlayingState:
@@ -1133,53 +1298,139 @@ class TTSApp(QWidget):
         if hasattr(self, 'was_playing') and self.was_playing:
             self.media_player.play()  # 如果之前在播放，则恢复播放
 
-    def open_audio_folder(self):
-        """打开音频保存文件夹"""
-        try:
-            # 获取应用程序所在目录
-            if hasattr(sys, '_MEIPASS'):
-                # PyInstaller打包后，使用可执行文件所在目录
-                app_dir = os.path.dirname(sys.executable)
-            else:
-                # 开发环境，使用当前脚本所在目录
-                app_dir = os.path.dirname(os.path.abspath(__file__))
-            
-            audio_dir = os.path.join(app_dir, "Audios")
-            
-            # 确保目录存在
-            if not os.path.exists(audio_dir):
-                os.makedirs(audio_dir)
-                self.log(f"创建音频保存目录: {audio_dir}")
-            
-            # 根据不同平台打开文件夹
-            if sys.platform == "win32":
-                os.startfile(audio_dir)
-            elif sys.platform == "darwin":  # macOS
-                subprocess.call(["open", audio_dir])
-            else:  # Linux
-                subprocess.call(["xdg-open", audio_dir])
-                
-            self.log(f"打开音频保存目录: {audio_dir}")
-        except Exception as e:
-            self.log(f"打开音频保存目录失败: {str(e)}")
-            InfoBar.error(
-                title="错误",
-                content=f"无法打开文件夹: {str(e)}",
-                parent=self
-            )
-
     def browse_prompt_audio(self):
         """Open file dialog to select prompt audio file."""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择参考音频文件",
             "",  # Start directory
-            "WAV 文件 (*.wav);;所有文件 (*.*)"
+            "音频文件 (*.wav *.mp3);;WAV 文件 (*.wav);;MP3 文件 (*.mp3);;所有文件 (*.*)"
         )
         if file_path:
-            self.selected_prompt_audio_path = file_path
-            self.prompt_audio_path_edit.setText(file_path)
-            self.log(f"已选择参考音频: {file_path}")
+            # Basic check if it's wav or mp3, though loading logic handles actual format
+            if file_path.lower().endswith(('.wav', '.mp3')):
+                self.selected_prompt_audio_path = file_path
+                self.prompt_audio_path_edit.setText(file_path)
+                self.log(f"已选择参考音频: {file_path}")
+            else:
+                InfoBar.warning("提示", "请选择有效的WAV或MP3文件", parent=self)
+                self.log(f"选择了无效的文件类型: {file_path}")
+
+    # --- New Methods for Chunked Synthesis --- 
+    def _concatenate_audio_chunks(self):
+        """Uses FFmpeg to concatenate temporary audio files into the final output."""
+        if not self.is_chunked_synthesis or not self.temp_audio_files:
+            self.log("没有临时文件需要合并。")
+            self._cleanup_synthesis("无需合并") # Still cleanup
+            return
+
+        if not self.ffmpeg_path:
+            self.log("错误：找不到 FFmpeg，无法合并音频块。")
+            self._cleanup_synthesis("缺少 FFmpeg") # Cleanup temporary files
+            return
+
+        # Create a temporary file list for FFmpeg
+        list_file_path = os.path.join(get_resource_path("Resources/output"), "ffmpeg_list.txt")
+        try:
+            with open(list_file_path, 'w', encoding='utf-8') as f:
+                for temp_file in self.temp_audio_files:
+                    # Ensure paths are suitable for FFmpeg (use forward slashes maybe?)
+                    # Or rely on subprocess handling it correctly on Windows.
+                    # Using absolute paths is generally safer.
+                    abs_path = os.path.abspath(temp_file)
+                    f.write(f"file '{abs_path}'\n") # Use single quotes for paths
+            self.log(f"创建 FFmpeg 文件列表: {list_file_path}")
+        except Exception as e:
+            self.log(f"创建 FFmpeg 文件列表失败: {e}")
+            self._cleanup_synthesis("创建列表文件失败")
+            return
+
+        # Construct FFmpeg command
+        # Use -safe 0 because we are providing absolute paths which might be considered unsafe otherwise.
+        command = [
+            self.ffmpeg_path,
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file_path,
+            '-c', 'copy', # Copy codec, assuming all chunks are wav
+            self.final_output_path
+        ]
+
+        self.log(f"执行 FFmpeg 命令: {' '.join(command)}")
+        concat_success = False
+        try:
+            # Run FFmpeg
+            # Use CREATE_NO_WINDOW on Windows to prevent console popup
+            startupinfo = None
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            result = subprocess.run(command, capture_output=True, text=True, check=False, encoding='utf-8', errors='ignore', startupinfo=startupinfo)
+            
+            if result.returncode == 0 and os.path.exists(self.final_output_path):
+                self.log(f"FFmpeg 合并成功！最终文件: {self.final_output_path}")
+                # Update player with the final merged file
+                self.player_file_path = self.final_output_path
+                self.play_button.setEnabled(True)
+                self.player_slider.setEnabled(True)
+                self.player_label.setText(os.path.basename(self.final_output_path))
+                InfoBar.success("成功", "分块语音合成并合并完成！", parent=self)
+                concat_success = True
+            else:
+                self.log(f"FFmpeg 合并失败。返回码: {result.returncode}")
+                self.log(f"FFmpeg 标准输出:\n{result.stdout}")
+                self.log(f"FFmpeg 错误输出:\n{result.stderr}")
+                InfoBar.error("失败", "合并音频块失败，请检查日志", parent=self)
+        except Exception as e:
+            self.log(f"执行 FFmpeg 时发生异常: {e}\n{traceback.format_exc()}")
+            InfoBar.error("错误", f"执行 FFmpeg 失败: {e}", parent=self)
+        finally:
+             # Always attempt cleanup, regardless of concatenation success
+             self._cleanup_synthesis("合并完成" if concat_success else "合并失败")
+             # Also try to remove the ffmpeg list file
+             try:
+                 if os.path.exists(list_file_path):
+                     os.remove(list_file_path)
+             except Exception as e:
+                 self.log(f"删除 FFmpeg 列表文件失败: {e}")
+
+    def _cleanup_synthesis(self, reason="未知原因"):
+        """Cleans up temporary files and resets synthesis state."""
+        self.log(f"开始清理合成状态 ({reason})...")
+        
+        # Delete temporary audio files
+        deleted_count = 0
+        failed_count = 0
+        if self.temp_audio_files:
+            self.log(f"尝试删除 {len(self.temp_audio_files)} 个临时文件...")
+            for temp_file in self.temp_audio_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                        deleted_count += 1
+                        # self.log(f"已删除: {temp_file}") # Optional: verbose logging
+                except Exception as e:
+                    failed_count += 1
+                    self.log(f"删除临时文件失败 {temp_file}: {e}")
+            self.log(f"临时文件清理完成：成功删除 {deleted_count} 个，失败 {failed_count} 个。")
+        else:
+            self.log("没有临时文件需要删除。")
+            
+        # Reset state variables
+        self.is_chunked_synthesis = False
+        self.text_chunks = []
+        self.current_chunk_index = 0
+        self.temp_audio_files = [] # Clear the list
+        self.final_output_path = ""
+        self.synthesis_thread = None # Clear thread reference
+
+        # Re-enable the synthesis button
+        self.synthesize_button.setEnabled(True)
+        self.synthesize_button.setText("开始合成")
+        self.log("合成状态已重置，按钮已启用。")
+    # -----------------------------------------
 
 # 启动应用
 if __name__ == '__main__':

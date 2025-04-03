@@ -41,7 +41,7 @@ The GUI interface has been modified for Spark-TTS voice cloning:
 *Replace with an actual screenshot if possible*
 
 - **Left Panel (Synthesis Inputs):**
-    - **参考音频 (.wav):** Click "浏览" to select a `.wav` file containing the voice you want to clone.
+    - **参考音频 (.wav / .mp3):** Click "浏览" to select a `.wav` or `.mp3` file containing the voice you want to clone. (Note: MP3 support depends on having necessary system audio libraries like ffmpeg installed).
     - **参考音频文本:** Enter the exact transcript (text content) corresponding to the selected reference audio file.
     - **合成文本:** Enter the text you want the cloned voice to speak.
     - **开始合成:** Click this button to start the voice cloning process.
@@ -55,7 +55,7 @@ The GUI interface has been modified for Spark-TTS voice cloning:
 ### Workflow:
 
 1.  Run `python tts_gui.py`.
-2.  Click "浏览" under "参考音频" to select your `.wav` voice sample.
+2.  Click "浏览" under "参考音频" to select your `.wav` or `.mp3` voice sample.
 3.  Enter the matching transcript for the reference audio in the "参考音频文本" field.
 4.  Enter the desired output text in the "合成文本" field.
 5.  Click "开始合成".
