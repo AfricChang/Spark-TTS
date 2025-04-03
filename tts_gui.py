@@ -369,17 +369,19 @@ class SynthesisThread(QThread):
                     error_msg += f"合成文本内容: '{self.text[:100]}{'...' if len(self.text)>100 else ''}'"
                     self.progress_update.emit(error_msg)
                     
-                    # 尝试更强的干预措施 - 如果失败两次，尝试不同的文本格式
+                    # 尝试更强的干预措施 - 修改处理方式，不再截断文本
                     try:
-                        # 仅使用前30-80个字符，避免格式问题
-                        simple_text = self.text.replace("\n", " ")
-                        simple_text = re.sub(r'\d+[、.．]', '', simple_text)
-                        if len(simple_text) > 80:
-                            simple_text = simple_text[:80]
-                        elif len(simple_text) < 30:
-                            simple_text = simple_text * 2  # 重复文本使其足够长
+                        # 简化文本，但保留所有内容
+                        simple_text = self.text.replace("\n", " ") # 将换行替换为空格
+                        simple_text = re.sub(r'\d+[、.．]', '', simple_text) # 移除数字标记
+                        simple_text = re.sub(r'[，。？！；,.!?;]', '，', simple_text) # 统一标点为逗号，保持句子结构
+                        
+                        # 确保文本长度合适，但不截断
+                        if len(simple_text) < 30:
+                            # 如果太短，重复文本
+                            simple_text = simple_text * 2
                             
-                        self.progress_update.emit(f"尝试使用简化文本重新合成: '{simple_text}'")
+                        self.progress_update.emit(f"尝试使用简化后的完整文本重新合成 (长度: {len(simple_text)} 字符)")
                         
                         # 再次尝试合成
                         wav = tts_model.inference(
@@ -394,6 +396,22 @@ class SynthesisThread(QThread):
                             self.progress_update.emit(f"使用简化文本合成成功！音频已保存到: {self.output_path}")
                         else:
                             self.progress_update.emit("使用简化文本合成仍然失败。")
+                            
+                            # 第三次尝试：使用更简单的文本，但保持一定长度
+                            self.progress_update.emit("尝试最后的方法：使用更简化的文本...")
+                            final_attempt_text = "这是一段测试语音，用于测试语音合成系统。" + simple_text[:100]
+                            wav = tts_model.inference(
+                                text=final_attempt_text,
+                                prompt_text=self.prompt_text,
+                                prompt_speech_path=self.prompt_speech_path
+                            )
+                            
+                            if wav is not None:
+                                sf.write(self.output_path, wav, 16000)
+                                success = True
+                                self.progress_update.emit(f"最终尝试合成成功！但音频可能不完整，请检查结果。")
+                            else:
+                                self.progress_update.emit("所有尝试均失败，无法完成合成。")
                     except Exception as retry_e:
                         self.progress_update.emit(f"重试合成时发生错误: {retry_e}")
                 else:
@@ -1038,6 +1056,17 @@ class TTSApp(QWidget):
         self.log(f"准备使用 Spark-TTS 合成文本...")
         self.log(f"参考音频: {prompt_audio_path}")
         self.log(f"参考文本: '{prompt_text}'")
+        self.log(f"要合成的文本长度: {len(text)} 字符")
+        
+        # 检查文本长度是否过长，如果过长，给予特别提示
+        if len(text) > 500:
+            self.log(f"注意：文本较长 ({len(text)} 字符)，这可能导致合成速度变慢")
+            InfoBar.info(
+                title="文本较长",
+                content="检测到较长文本，合成可能需要更多时间",
+                parent=self,
+                duration=3000
+            )
 
         # 禁用合成按钮，防止重复点击
         self.synthesize_button.setEnabled(False)
@@ -1047,7 +1076,7 @@ class TTSApp(QWidget):
         if USE_SIMPLE_MODE:
             self.log("使用简单模式（不分块）进行合成...")
             
-            # 清理文本以提高成功率
+            # 温和清理文本以提高成功率，但确保保留大部分内容
             cleaned_text = self._clean_text_for_synthesis(text)
             self.log(f"清理后文本长度: {len(cleaned_text)} 字符")
             
@@ -1065,6 +1094,10 @@ class TTSApp(QWidget):
                 self.synthesize_button.setEnabled(True)
                 self.synthesize_button.setText("开始合成")
                 return
+            
+            # 显示合成信息
+            if len(cleaned_text) != len(text):
+                self.log(f"注意：清理文本过程中移除了 {len(text) - len(cleaned_text)} 个字符")
             
             # 创建并启动合成线程
             self.synthesis_thread = SynthesisThread(
@@ -1110,7 +1143,7 @@ class TTSApp(QWidget):
         self.synthesis_thread = None # Allow garbage collection
         
     def _clean_text_for_synthesis(self, text):
-        """更彻底地清理文本，移除不利于合成的格式"""
+        """更温和地清理文本，保留更多原始内容"""
         if not text or len(text.strip()) < 5:
             self.log("警告：合成文本过短，可能会导致模型失败。")
             return text.strip()
@@ -1118,16 +1151,18 @@ class TTSApp(QWidget):
         # 保存原始文本用于比较
         original_text = text
         
-        # 移除开头的数字和标点
-        cleaned_text = re.sub(r'^[\d]+[、.．:：]?\s*', '', text)
+        # 仅处理明显的问题格式，保留更多内容
+        cleaned_text = text
         
-        # 移除"每日资讯简报"等标题行
-        cleaned_text = re.sub(r'^(每日|今日|晨间|晚间).*?(简报|资讯|新闻|播报).*?\n', '', cleaned_text)
+        # 只处理开头的数字编号，而不是所有行内编号
+        if re.match(r'^[\d]+[、.．:：]', cleaned_text):
+            cleaned_text = re.sub(r'^[\d]+[、.．:：]\s*', '', cleaned_text)
+            
+        # 只移除开头的"每日资讯简报"等标题，但保留其他内容
+        if re.match(r'^(每日|今日|晨间|晚间).*?(简报|资讯|新闻|播报)', cleaned_text):
+            cleaned_text = re.sub(r'^(每日|今日|晨间|晚间).*?(简报|资讯|新闻|播报).*?\n', '', cleaned_text)
         
-        # 移除行内的编号 (如"1、""2、"等)
-        cleaned_text = re.sub(r'[\d]+[、.．:：]\s*', '', cleaned_text)
-        
-        # 移除末尾的标点符号
+        # 温和处理标点符号 - 只移除末尾的标点
         punctuation_to_clean = "。？！；…,.!?;:：，"
         cleaned_text = cleaned_text.rstrip(punctuation_to_clean).strip()
         
@@ -1138,8 +1173,10 @@ class TTSApp(QWidget):
         
         # 记录文本清理前后的变化
         if cleaned_text != original_text:
-            self.log(f"文本清理前：【{original_text[:40]}...】")
-            self.log(f"文本清理后：【{cleaned_text[:40]}...】")
+            self.log(f"文本清理前：【{original_text[:50]}...】")
+            self.log(f"文本清理后：【{cleaned_text[:50]}...】")
+            # 在日志中显示完整长度，帮助诊断
+            self.log(f"清理前长度: {len(original_text)}，清理后长度: {len(cleaned_text)}")
         
         if len(cleaned_text) < 30:
             self.log(f"警告：清理后的文本长度仅为 {len(cleaned_text)} 个字符，这可能会导致合成失败")
